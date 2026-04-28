@@ -50,7 +50,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
-	"github.com/crossplane-contrib/provider-ansible/apis/v1alpha1"
+	v1alpha1 "github.com/crossplane-contrib/provider-ansible/apis/cluster/v1alpha1"
 	"github.com/crossplane-contrib/provider-ansible/internal/ansible"
 	"github.com/crossplane-contrib/provider-ansible/pkg/galaxyutil"
 	"github.com/crossplane-contrib/provider-ansible/pkg/runnerutil"
@@ -81,7 +81,7 @@ const (
 )
 
 const (
-	leaseNameTemplate           = "provider-ansible-lease-%d"
+	leaseNameTemplate           = "provider-ansible-cluster-lease-%d"
 	leaseDurationSeconds        = 30
 	leaseRenewalInterval        = 5 * time.Second
 	leaseAcquireAttemptInterval = 5 * time.Second
@@ -103,7 +103,7 @@ type ansibleRunner interface {
 	Run(ctx context.Context) (io.Reader, error)
 }
 
-// SetupOptions constains settings specific to the ansible run controller.
+// SetupOptions contains settings specific to the cluster AnsibleRun controller.
 type SetupOptions struct {
 	AnsibleCollectionsPath string
 	AnsibleRolesPath       string
@@ -114,7 +114,7 @@ type SetupOptions struct {
 	ProviderCancel         context.CancelFunc
 }
 
-// Setup adds a controller that reconciles AnsibleRun managed resources.
+// Setup adds a controller that reconciles cluster-scoped AnsibleRun managed resources.
 func Setup(mgr ctrl.Manager, o controller.Options, s SetupOptions) error {
 	name := managed.ControllerName(v1alpha1.AnsibleRunGroupKind)
 
@@ -179,8 +179,6 @@ func Setup(mgr ctrl.Manager, o controller.Options, s SetupOptions) error {
 		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
 }
 
-// A connector is expected to produce an ExternalClient when its Connect method
-// is called.
 type connector struct {
 	kube      client.Client
 	usage     resource.Tracker
@@ -191,12 +189,6 @@ type connector struct {
 }
 
 func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.TypedExternalClient[*v1alpha1.AnsibleRun], error) { //nolint:gocyclo
-	// NOTE(negz): This method is slightly over our complexity goal, but I
-	// can't immediately think of a clean way to decompose it without
-	// affecting readability.
-
-	// NOTE(negz): This directory will be garbage collected by the workdir
-	// garbage collector that is started in Setup.
 	dir := filepath.Join(baseWorkingDir, string(cr.GetUID()))
 	if err := c.fs.MkdirAll(dir, 0700); resource.Ignore(os.IsExist, err) != nil {
 		return nil, fmt.Errorf("%s: %s: %w", baseWorkingDir, errMkdir, err)
@@ -214,7 +206,6 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 	if cr.Spec.ForProvider.ExecutableInventory {
 		inventoryPerm = 0700
 	}
-	// Saved inventory needed for ansible content hosts
 	var buff bytes.Buffer
 	for _, i := range cr.Spec.ForProvider.Inventories {
 		data, err := resource.CommonCredentialExtractor(ctx, i.Source, c.kube, i.CommonCredentialSelectors)
@@ -234,17 +225,12 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 		if err := c.fs.WriteFile(filepath.Join(dir, runnerutil.Hosts), buff.Bytes(), inventoryPerm); err != nil {
 			return nil, fmt.Errorf("%s %s: %w", errWriteInventory, runnerutil.Hosts, err)
 		}
-		// WriteFile only sets permissions for new files, do an explicit chmod to ensure changing permissions are updated
-		// on existing files
 		err := c.fs.Chmod(filepath.Join(dir, runnerutil.Hosts), inventoryPerm)
 		if err != nil {
 			return nil, fmt.Errorf("%s %s: %w", errChmodInventory, runnerutil.Hosts, err)
 		}
 	}
 
-	// prepare git credentials for ansible-galaxy to fetch remote roles
-	// TODO(fahed) support other private remote repository
-	// NOTE(ytsarev): Retrieve .git-credentials from Spec to /tmp outside of AnsibleRun directory
 	gitCredDir := filepath.Clean(filepath.Join("/tmp", dir))
 	if err := c.fs.MkdirAll(gitCredDir, 0700); err != nil {
 		return nil, fmt.Errorf("%s: %w", errWriteGitCreds, err)
@@ -261,8 +247,6 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 		if err := c.fs.WriteFile(p, data, 0600); err != nil {
 			return nil, fmt.Errorf("%s: %w", errWriteGitCreds, err)
 		}
-		// NOTE(ytsarev): Make go-getter pick up .git-credentials, see /.gitconfig in the container image
-		// TODO: check wether go-getter is used in the ansible case
 		err = os.Setenv("GIT_CRED_DIR", gitCredDir)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", errRemoteConfiguration, err)
@@ -271,7 +255,6 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 
 	var requirementRoles []byte
 	if len(cr.Spec.ForProvider.Roles) != 0 {
-		// marshall cr.Spec.ForProvider.Roles entries into yaml document
 		rolesMap := make(map[string][]v1alpha1.Role)
 		rolesMap["roles"] = cr.Spec.ForProvider.Roles
 		var err error
@@ -285,7 +268,6 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 		}
 	}
 
-	// Saved credentials needed for ansible playbooks execution
 	for _, cd := range pc.Spec.Credentials {
 		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
 		if err != nil {
@@ -299,10 +281,8 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 
 	ps := c.ansible(dir)
 
-	// prepare behavior vars
 	behaviorVars := addBehaviorVars(pc)
 
-	// Requirements is a list of collections/roles to be installed, it is stored in requirements file
 	requirementRolesStr := string(requirementRoles)
 	if pc.Spec.Requirements != nil || requirementRolesStr != "" {
 		var installCollections, installRoles bool
@@ -317,12 +297,10 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 			installRoles = true
 		}
 
-		// write requirements to requirements.yml
 		req := strings.Join(reqSlice, "\n")
 		if err := c.fs.WriteFile(filepath.Join(dir, galaxyutil.RequirementsFile), []byte(req), 0600); err != nil {
 			return nil, fmt.Errorf("%s: %w", errWriteConfig, err)
 		}
-		// install ansible requirements using ansible-galaxy
 		if installCollections {
 			if err := ps.GalaxyInstall(ctx, behaviorVars, "collection"); err != nil {
 				return nil, err
@@ -333,7 +311,6 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 				return nil, err
 			}
 		}
-
 	}
 
 	runCR := ansible.RunCR{
@@ -347,7 +324,6 @@ func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (manag
 	r, err := ps.Init(ctx, runCR, behaviorVars)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", errInit, err)
-
 	}
 
 	return &external{runner: r, kube: c.kube}, nil
@@ -359,16 +335,11 @@ type external struct {
 }
 
 func (e *external) Disconnect(ctx context.Context) error {
-	// Unimplemented, required by newer versions of crossplane-runtime
 	return nil
 }
 
 // nolint: gocyclo
-// TODO reduce cyclomatic complexity
 func (c *external) Observe(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
-	/* set Deletion Policy to Orphan as we cannot observe the external resource.
-	   So we won't wait for external resource deletion before attempting
-	   to delete the managed resource */
 	cr.SetDeletionPolicy(xpv1.DeletionOrphan)
 
 	switch c.runner.GetAnsibleRunPolicy().Name {
@@ -415,9 +386,6 @@ func (c *external) Observe(ctx context.Context, cr *v1alpha1.AnsibleRun) (manage
 		}
 		changes := ansible.Diff(res)
 
-		// At this level, the ansible cannot detect the existence or not of the external resource
-		// due to the lack of the state in the ansible technology. So we consider that the externl resource
-		// exists and trigger post-observation step(s) based on changes returned by the ansible-runner stats
 		return managed.ExternalObservation{
 			ResourceExists:          true,
 			ResourceUpToDate:        !changes,
@@ -431,19 +399,15 @@ func (c *external) Observe(ctx context.Context, cr *v1alpha1.AnsibleRun) (manage
 }
 
 func (c *external) Create(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.ExternalCreation, error) {
-	// No difference from the provider side which lifecycle method to choose in this case of Create() or Update()
 	u, err := c.Update(ctx, cr)
 	return managed.ExternalCreation(u), err
 }
 
 func (c *external) Update(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.ExternalUpdate, error) {
-	// disable checkMode for real action
 	c.runner.EnableCheckMode(false)
 	if err := c.runAnsible(ctx, cr); err != nil {
 		return managed.ExternalUpdate{}, fmt.Errorf("running ansible: %w", err)
 	}
-
-	// TODO handle ConnectionDetails https://github.com/multicloudlab/crossplane-provider-ansible/pull/74#discussion_r888467991
 	return managed.ExternalUpdate{ConnectionDetails: nil}, nil
 }
 
@@ -473,14 +437,11 @@ func getLastAppliedParameters(observed *v1alpha1.AnsibleRun) (*v1alpha1.AnsibleR
 	if err := json.Unmarshal([]byte(lastApplied), lastParameters); err != nil {
 		return nil, fmt.Errorf("%s: %w", errUnmarshalTemplate, err)
 	}
-
 	return lastParameters, nil
 }
 
 func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alpha1.AnsibleRunParameters, desired *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
-	// Mark as up-to-date if last is equal to desired
 	isUpToDate := (lastParameters != nil && equality.Semantic.DeepEqual(*lastParameters, desired.Spec.ForProvider))
-
 	isLastSyncOK := (desired.GetCondition(xpv1.TypeSynced).Status == v1.ConditionTrue)
 
 	if isUpToDate && isLastSyncOK {
@@ -488,7 +449,6 @@ func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alph
 		if err := c.kube.Status().Update(ctx, desired); err != nil {
 			return managed.ExternalObservation{}, fmt.Errorf("updating status: %w", err)
 		}
-		// nothing to do for this run
 		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 	}
 
@@ -496,7 +456,6 @@ func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alph
 	if err != nil {
 		return managed.ExternalObservation{}, err
 	}
-	// set LastAppliedConfig Annotation to avoid useless cmd run
 	meta.AddAnnotations(desired, map[string]string{
 		v1.LastAppliedConfigAnnotation: string(out),
 	})
@@ -516,10 +475,6 @@ func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alph
 		return managed.ExternalObservation{}, fmt.Errorf("running ansible: %w", err)
 	}
 
-	// The crossplane runtime is not aware of the external resource created by ansible content.
-	// Nothing will notify us if and when the ansible content we manage
-	// changes, so we requeue a speculative reconcile after the specified poll
-	// interval in order to observe it and react accordingly.
 	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 }
 
@@ -563,13 +518,10 @@ func (c *connector) releaseLease(ctx context.Context, kube client.Client, index 
 	return kube.Delete(ctx, lease)
 }
 
-// Attempts to acquire or renew a lease for the current replica ID
-// Returns an error when unable to obtain the lease
 func (c *connector) acquireLease(ctx context.Context, kube client.Client, index uint32) error {
 	lease := &coordinationv1.Lease{}
 	leaseName := c.generateLeaseName(index)
-	leaseDurationSeconds := ptr.To(int32(leaseDurationSeconds))
-
+	leaseDuration := ptr.To(int32(leaseDurationSeconds))
 	ns := "upbound-system"
 
 	if err := kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: leaseName}, lease); err != nil {
@@ -577,7 +529,6 @@ func (c *connector) acquireLease(ctx context.Context, kube client.Client, index 
 			return err
 		}
 
-		// Create a new Lease
 		lease = &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      leaseName,
@@ -586,7 +537,7 @@ func (c *connector) acquireLease(ctx context.Context, kube client.Client, index 
 			Spec: coordinationv1.LeaseSpec{
 				HolderIdentity:       &c.replicaID,
 				RenewTime:            &metav1.MicroTime{Time: time.Now()},
-				LeaseDurationSeconds: leaseDurationSeconds,
+				LeaseDurationSeconds: leaseDuration,
 			},
 		}
 		if err := kube.Create(ctx, lease); err != nil {
@@ -596,21 +547,17 @@ func (c *connector) acquireLease(ctx context.Context, kube client.Client, index 
 		return nil
 	}
 
-	// Check if the lease is held by another replica and is not expired
 	if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != c.replicaID {
 		if lease.Spec.RenewTime != nil && time.Since(lease.Spec.RenewTime.Time) < time.Duration(*lease.Spec.LeaseDurationSeconds)*time.Second {
-			// Lease is held by another replica and is not expired
 			return fmt.Errorf("lease is still held by %s", *lease.Spec.HolderIdentity)
 		}
 	}
 
-	// Update the lease to acquire it
 	lease.Spec.HolderIdentity = ptr.To(c.replicaID)
 	lease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
-	lease.Spec.LeaseDurationSeconds = leaseDurationSeconds
+	lease.Spec.LeaseDurationSeconds = leaseDuration
 	if err := kube.Update(ctx, lease); err != nil {
 		if kerrors.IsConflict(err) {
-			// Another replica updated the lease concurrently, retry
 			return err
 		}
 		return fmt.Errorf("failed to update lease: %w", err)
@@ -620,8 +567,6 @@ func (c *connector) acquireLease(ctx context.Context, kube client.Client, index 
 	return nil
 }
 
-// Finds an available shard and acquires a lease for it. Will attempt to obtain one indefinitely.
-// This will also start a background go-routine to renew the lease continuously and release it when the process receives a shutdown signal
 func (c *connector) acquireAndHoldShard(o controller.Options, s SetupOptions) (uint32, error) {
 	ctx := s.ProviderCtx
 	var currentShard uint32
@@ -661,7 +606,6 @@ AcquireLease:
 						}
 					}
 				}()
-				// Lease is acquired and background goroutine started for renewal, we can safely break to return the current shard
 				break AcquireLease
 			} else {
 				o.Logger.Debug("cannot acquire lease", "id", i, "err", err)

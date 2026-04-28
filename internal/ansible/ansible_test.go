@@ -30,24 +30,17 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"gotest.tools/v3/assert"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-
-	"github.com/crossplane-contrib/provider-ansible/apis/v1alpha1"
 )
 
 const (
 	baseWorkingDir = "ansibleDir"
 	uid            = types.UID("definitely-a-uuid")
-	name           = "testApp"
 	requirements   = `---
                     collections:`
 )
 
-var (
-	ctx        = context.Background()
-	objectMeta = metav1.ObjectMeta{Name: name, UID: uid}
-)
+var ctx = context.Background()
 
 func prepareAnsibleContext(dir string) (string, error) {
 	tmpDir, err := os.MkdirTemp("", "ansible-init-test")
@@ -97,22 +90,16 @@ func TestAnsibleRunPolicyInit(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.policy, func(t *testing.T) {
-			objectMeta.Annotations = map[string]string{AnnotationKeyPolicyRun: tc.policy}
-			myRole := v1alpha1.Role{Name: "MyRole"}
-			cr := v1alpha1.AnsibleRun{
-				ObjectMeta: objectMeta,
-				Spec: v1alpha1.AnsibleRunSpec{
-					ForProvider: v1alpha1.AnsibleRunParameters{
-						Roles: []v1alpha1.Role{myRole},
-					},
-				},
+			cr := RunCR{
+				Roles:     []RunRole{{Name: "MyRole"}},
+				RunPolicy: tc.policy,
 			}
 
 			ps := Parameters{
 				WorkingDirPath: ansibleCtx,
 			}
 
-			testRunner, err := ps.Init(ctx, &cr, nil)
+			testRunner, err := ps.Init(ctx, cr, nil)
 			if err != nil {
 				t.Fatalf("Error occurred unexpectedly: %v", err)
 			}
@@ -136,17 +123,9 @@ func TestInit(t *testing.T) {
 	dir := t.TempDir()
 
 	fakePlaybook := "fake playbook"
-	run := &v1alpha1.AnsibleRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Annotations: map[string]string{
-				AnnotationKeyPolicyRun: "ObserveAndDelete",
-			},
-		},
-		Spec: v1alpha1.AnsibleRunSpec{
-			ForProvider: v1alpha1.AnsibleRunParameters{
-				PlaybookInline: &fakePlaybook,
-			},
-		},
+	run := RunCR{
+		PlaybookInline: &fakePlaybook,
+		RunPolicy:      "ObserveAndDelete",
 	}
 
 	params := Parameters{

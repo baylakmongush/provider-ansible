@@ -20,19 +20,32 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	ansiblerun "github.com/crossplane-contrib/provider-ansible/internal/controller/ansibleRun"
-
+	clusteransiblerun "github.com/crossplane-contrib/provider-ansible/internal/controller/cluster/ansiblerun"
 	"github.com/crossplane-contrib/provider-ansible/internal/controller/config"
+	namespacedansiblerun "github.com/crossplane-contrib/provider-ansible/internal/controller/namespaced/ansiblerun"
 )
 
-// Setup creates all Template controllers with the supplied logger and adds them to
+// Setup creates all AnsibleRun controllers with the supplied logger and adds them to
 // the supplied manager.
-func Setup(mgr ctrl.Manager, o controller.Options, s ansiblerun.SetupOptions) error {
+func Setup(mgr ctrl.Manager, o controller.Options, s clusteransiblerun.SetupOptions) error {
 	if err := config.Setup(mgr, o); err != nil {
 		return err
 	}
 
-	if err := ansiblerun.Setup(mgr, o, s); err != nil {
+	if err := clusteransiblerun.Setup(mgr, o, s); err != nil {
+		return err
+	}
+
+	nss := namespacedansiblerun.SetupOptions{
+		AnsibleCollectionsPath: s.AnsibleCollectionsPath,
+		AnsibleRolesPath:       s.AnsibleRolesPath,
+		Timeout:                s.Timeout,
+		ArtifactsHistoryLimit:  s.ArtifactsHistoryLimit,
+		ReplicasCount:          s.ReplicasCount,
+		ProviderCtx:            s.ProviderCtx,
+		ProviderCancel:         s.ProviderCancel,
+	}
+	if err := namespacedansiblerun.Setup(mgr, o, nss); err != nil {
 		return err
 	}
 
