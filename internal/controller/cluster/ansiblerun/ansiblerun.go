@@ -81,7 +81,7 @@ const (
 )
 
 const (
-	leaseNameTemplate           = "provider-ansible-cluster-lease-%d"
+	leaseNameTemplate           = "provider-ansible-lease-%d"
 	leaseDurationSeconds        = 30
 	leaseRenewalInterval        = 5 * time.Second
 	leaseAcquireAttemptInterval = 5 * time.Second
