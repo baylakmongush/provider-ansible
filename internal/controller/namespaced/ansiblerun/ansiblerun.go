@@ -588,8 +588,6 @@ AcquireLease:
 				currentShard = i
 				o.Logger.Debug("acquired lease", "id", i)
 				go func() {
-					sigHandler := ctrl.SetupSignalHandler()
-
 					for {
 						select {
 						case <-time.After(leaseRenewalInterval):
@@ -599,13 +597,12 @@ AcquireLease:
 							} else {
 								o.Logger.Debug("renewed lease", "id", i)
 							}
-						case <-sigHandler.Done():
+						case <-ctx.Done():
 							o.Logger.Info("controller is shutting down, releasing lease")
-							if err := c.releaseLease(ctx, kube, i); err != nil {
+							if err := c.releaseLease(context.Background(), kube, i); err != nil {
 								o.Logger.Info("failed to release lease", "lease", err)
 							}
 							o.Logger.Debug("released lease")
-							s.ProviderCancel()
 							return
 						}
 					}

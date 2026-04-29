@@ -1,0 +1,16 @@
+apiVersion: ansible.m.crossplane.io/v1alpha1
+kind: AnsibleRun
+metadata:
+  name: example
+  namespace: default
+spec:
+  providerConfigRef:
+    name: default
+  forProvider:
+    playbookInline: |
+      ---
+      - hosts: localhost
+        tasks:
+          - name: ansibleplaybook-simple
+            debug:
+              msg: Your are running 'ansibleplaybook-simple' namespaced example

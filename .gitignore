@@ -17,6 +17,7 @@
 /.cache
 /.work
 /_output
+/bin/
 cover.out
 /vendor
 /.vendor-new
