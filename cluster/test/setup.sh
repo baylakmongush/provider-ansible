@@ -83,22 +83,10 @@ spec:
 EOF
 echo_step_completed "cluster AnsibleRun created"
 
-# Apply namespaced ProviderConfig and AnsibleRun
+# Apply namespaced AnsibleRun
 echo_step "Creating namespace demo"
 ${KUBECTL} create namespace demo --dry-run=client -o yaml | ${KUBECTL} apply -f -
 echo_step_completed "namespace demo ready"
-
-echo_step "Applying namespaced ProviderConfig"
-cat <<EOF | ${KUBECTL} apply -f -
-apiVersion: ansible.m.crossplane.io/v1alpha1
-kind: ProviderConfig
-metadata:
-  name: provider-ansible-config
-  namespace: demo
-spec:
-  credentials: []
-EOF
-echo_step_completed "namespaced ProviderConfig created"
 
 echo_step "Applying namespaced AnsibleRun"
 cat <<EOF | ${KUBECTL} apply -f -

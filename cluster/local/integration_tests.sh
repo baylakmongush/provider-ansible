@@ -76,9 +76,4 @@ if [[ "$NS_API" != "ansible.m.crossplane.io/v1alpha1" ]]; then
 fi
 echo_step_completed "namespaced AnsibleRun apiVersion: $NS_API"
 
-# Teardown
-echo_step "Running teardown"
-KUBECTL="${KUBECTL}" "${ROOT_DIR}/cluster/test/teardown.sh"
-echo_step_completed "Teardown done"
-
 echo_info "All integration tests passed"
