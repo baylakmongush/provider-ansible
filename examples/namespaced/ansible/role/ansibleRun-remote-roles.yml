@@ -1,0 +1,44 @@
+apiVersion: ansible.m.crossplane.io/v1alpha1
+kind: AnsibleRun
+metadata:
+  annotations:
+    ansible.crossplane.io/runPolicy: CheckWhenObserve
+  name: gcpdisk
+  namespace: default
+spec:
+  forProvider:
+    roles:
+      - name: ansible_provider.gcpdisk_role
+        src: https://github.com/multicloudlab/crossplane-ansible-provider-sample.git
+    vars:
+      project:
+        disk:
+          size: 20
+          key: 718BDCC469891
+          zone: europe-west1-b
+        id: test_project
+  providerConfigRef:
+    name: gcpconfig
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: default
+  name: gcp-credentials
+type: Opaque
+data:
+  credentials: BASE64ENCODED_PROVIDER_CREDS
+---
+apiVersion: ansible.m.crossplane.io/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: gcpconfig
+  namespace: default
+spec:
+  credentials:
+    - filename: gcp-credentials.json
+      source: Secret
+      secretRef:
+        namespace: default
+        name: gcp-credentials
+        key: credentials

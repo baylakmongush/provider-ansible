@@ -35,8 +35,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/crossplane-contrib/provider-ansible/apis"
-	ansible "github.com/crossplane-contrib/provider-ansible/internal/controller"
-	ansiblerun "github.com/crossplane-contrib/provider-ansible/internal/controller/ansibleRun"
+	"github.com/crossplane-contrib/provider-ansible/internal/controller/config"
+	clusteransiblerun "github.com/crossplane-contrib/provider-ansible/internal/controller/cluster/ansiblerun"
+	namespacedansiblerun "github.com/crossplane-contrib/provider-ansible/internal/controller/namespaced/ansiblerun"
 )
 
 func main() {
@@ -59,9 +60,6 @@ func main() {
 	zl := zap.New(zap.UseDevMode(*debug))
 	log := logging.NewLogrLogger(zl.WithName("provider-ansible"))
 	if *debug {
-		// The controller-runtime runs with a no-op logger by default. It is
-		// *very* verbose even at info level, so we only provide it a real
-		// logger when we're running in debug mode.
 		ctrl.SetLogger(zl)
 	} else {
 		ctrl.SetLogger(zap.New(zap.WriteTo(io.Discard)))
@@ -101,7 +99,8 @@ func main() {
 	}
 
 	providerCtx, cancel := context.WithCancel(context.Background())
-	ansibleOpts := ansiblerun.SetupOptions{
+
+	clusterOpts := clusteransiblerun.SetupOptions{
 		AnsibleCollectionsPath: *ansibleCollectionsPath,
 		AnsibleRolesPath:       *ansibleRolesPath,
 		Timeout:                *timeout,
@@ -110,6 +109,18 @@ func main() {
 		ProviderCtx:            providerCtx,
 		ProviderCancel:         cancel,
 	}
-	kingpin.FatalIfError(ansible.Setup(mgr, o, ansibleOpts), "Cannot setup Ansible controllers")
+	nsOpts := namespacedansiblerun.SetupOptions{
+		AnsibleCollectionsPath: *ansibleCollectionsPath,
+		AnsibleRolesPath:       *ansibleRolesPath,
+		Timeout:                *timeout,
+		ArtifactsHistoryLimit:  *artifactsHistoryLimit,
+		ReplicasCount:          *replicasCount,
+		ProviderCtx:            providerCtx,
+		ProviderCancel:         cancel,
+	}
+
+	kingpin.FatalIfError(config.Setup(mgr, o), "Cannot setup ProviderConfig controller")
+	kingpin.FatalIfError(clusteransiblerun.Setup(mgr, o, clusterOpts), "Cannot setup cluster AnsibleRun controller")
+	kingpin.FatalIfError(namespacedansiblerun.Setup(mgr, o, nsOpts), "Cannot setup namespaced AnsibleRun controller")
 	kingpin.FatalIfError(mgr.Start(providerCtx), "Cannot start controller manager")
 }

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// All implementation has been moved to setup.go and connector.go.
-// This file is intentionally empty.
-package ansiblerun
+// Package v1alpha1 contains the core resources of the Ansible provider.
+// +kubebuilder:object:generate=true
+// +groupName=ansible.crossplane.io
+// +versionName=v1alpha1
+package v1alpha1

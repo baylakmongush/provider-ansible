@@ -20,13 +20,15 @@ package apis
 import (
 	"k8s.io/apimachinery/pkg/runtime"
 
-	"github.com/crossplane-contrib/provider-ansible/apis/v1alpha1"
+	clusteredv1alpha1 "github.com/crossplane-contrib/provider-ansible/apis/cluster/v1alpha1"
+	namespacedv1alpha1 "github.com/crossplane-contrib/provider-ansible/apis/namespaced/v1alpha1"
 )
 
 func init() {
 	// Register the types with the Scheme so the components can map objects to GroupVersionKinds and back
 	AddToSchemes = append(AddToSchemes,
-		v1alpha1.SchemeBuilder.AddToScheme,
+		clusteredv1alpha1.SchemeBuilder.AddToScheme,
+		namespacedv1alpha1.SchemeBuilder.AddToScheme,
 	)
 }
 

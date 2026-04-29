@@ -18,14 +18,13 @@ package ansiblerun
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
-
-	"errors"
-	"fmt"
-	"io"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -40,14 +39,40 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/pkg/test"
 
-	"github.com/crossplane-contrib/provider-ansible/apis/v1alpha1"
+	clusterv1alpha1 "github.com/crossplane-contrib/provider-ansible/apis/cluster/v1alpha1"
 	"github.com/crossplane-contrib/provider-ansible/internal/ansible"
 	"github.com/crossplane-contrib/provider-ansible/pkg/runnerutil"
 )
 
 const (
 	uid = types.UID("no-you-id")
+
+	// testBaseWorkingDir matches the cluster controller's BaseWorkingDir for path assertions.
+	testBaseWorkingDir      = "/ansibleDir"
+	testLeaseNameTemplate   = "provider-ansible-lease-%d"
+	testLeaseNamespace      = "upbound-system"
 )
+
+// testForProvider converts a cluster-scoped AnsibleRun to the common ForProvider type.
+// Used in tests to supply the getForProvider function to connector and external.
+func testForProvider(cr *clusterv1alpha1.AnsibleRun) ForProvider {
+	fp := ForProvider{
+		InventoryInline:     cr.Spec.ForProvider.InventoryInline,
+		ExecutableInventory: cr.Spec.ForProvider.ExecutableInventory,
+		PlaybookInline:      cr.Spec.ForProvider.PlaybookInline,
+		Vars:                cr.Spec.ForProvider.Vars,
+	}
+	for _, inv := range cr.Spec.ForProvider.Inventories {
+		fp.Inventories = append(fp.Inventories, Inventory{
+			Source:                   inv.Source,
+			CommonCredentialSelectors: inv.CommonCredentialSelectors,
+		})
+	}
+	for _, r := range cr.Spec.ForProvider.Roles {
+		fp.Roles = append(fp.Roles, Role{Name: r.Name, Src: r.Src, Version: r.Version})
+	}
+	return fp
+}
 
 type ErrFs struct {
 	afero.Fs
@@ -79,12 +104,12 @@ func (e *ErrFs) Chmod(name string, mode os.FileMode) error {
 }
 
 type MockPs struct {
-	MockInit          func(ctx context.Context, cr *v1alpha1.AnsibleRun, behaviorVars map[string]string) (*ansible.Runner, error)
+	MockInit          func(ctx context.Context, cr ansible.RunCR, behaviorVars map[string]string) (*ansible.Runner, error)
 	MockGalaxyInstall func(ctx context.Context, behaviorVars map[string]string, requirementsType string) error
 	MockAddFile       func(path string, content []byte) error
 }
 
-func (ps MockPs) Init(ctx context.Context, cr *v1alpha1.AnsibleRun, behaviorVars map[string]string) (*ansible.Runner, error) {
+func (ps MockPs) Init(ctx context.Context, cr ansible.RunCR, behaviorVars map[string]string) (*ansible.Runner, error) {
 	return ps.MockInit(ctx, cr, behaviorVars)
 }
 
@@ -129,18 +154,18 @@ func TestConnect(t *testing.T) {
 	pbCreds := "credentials"
 	requirements := "fakeRequirements"
 	inlineYaml := "IamYaml"
-	myRole := v1alpha1.Role{Name: "MyRole"}
+	myRole := clusterv1alpha1.Role{Name: "MyRole"}
 
 	type fields struct {
-		kube    client.Client
-		usage   resource.Tracker
-		fs      afero.Afero
-		ansible func(dir string) params
+		kube        client.Client
+		usage       resource.Tracker
+		fs          afero.Afero
+		ansibleFunc func(dir string) params
 	}
 
 	type args struct {
 		ctx context.Context
-		cr  *v1alpha1.AnsibleRun
+		cr  *clusterv1alpha1.AnsibleRun
 	}
 
 	cases := map[string]struct {
@@ -155,16 +180,16 @@ func TestConnect(t *testing.T) {
 				fs: afero.Afero{
 					Fs: &ErrFs{
 						Fs:        afero.NewMemMapFs(),
-						mkdirErrs: map[string]error{filepath.Join(baseWorkingDir, string(uid)): errBoom},
+						mkdirErrs: map[string]error{filepath.Join(testBaseWorkingDir, string(uid)): errBoom},
 					},
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
 				},
 			},
-			want: fmt.Errorf("%s: %s: %w", baseWorkingDir, errMkdir, errBoom),
+			want: fmt.Errorf("%s: %s: %w", testBaseWorkingDir, errMkdir, errBoom),
 		},
 		"TrackUsageError": {
 			reason: "We should return any error encountered while tracking ProviderConfig usage",
@@ -173,7 +198,7 @@ func TestConnect(t *testing.T) {
 				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
 				},
 			},
@@ -189,9 +214,9 @@ func TestConnect(t *testing.T) {
 				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
@@ -205,12 +230,8 @@ func TestConnect(t *testing.T) {
 			fields: fields{
 				kube: &test.MockClient{
 					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
-						if pc, ok := obj.(*v1alpha1.ProviderConfig); ok {
-							// We're testing through CommonCredentialsExtractor
-							// here. We cause an error to be returned by asking
-							// for credentials from the environment, but not
-							// specifying an environment variable.
-							pc.Spec.Credentials = []v1alpha1.ProviderCredentials{{
+						if pc, ok := obj.(*clusterv1alpha1.ProviderConfig); ok {
+							pc.Spec.Credentials = []clusterv1alpha1.ProviderCredentials{{
 								Source: xpv1.CredentialsSourceEnvironment,
 							}}
 						}
@@ -221,9 +242,9 @@ func TestConnect(t *testing.T) {
 				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
@@ -237,8 +258,8 @@ func TestConnect(t *testing.T) {
 			fields: fields{
 				kube: &test.MockClient{
 					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
-						if pc, ok := obj.(*v1alpha1.ProviderConfig); ok {
-							pc.Spec.Credentials = []v1alpha1.ProviderCredentials{{
+						if pc, ok := obj.(*clusterv1alpha1.ProviderConfig); ok {
+							pc.Spec.Credentials = []clusterv1alpha1.ProviderCredentials{{
 								Filename: pbCreds,
 								Source:   xpv1.CredentialsSourceNone,
 							}}
@@ -250,14 +271,14 @@ func TestConnect(t *testing.T) {
 				fs: afero.Afero{
 					Fs: &ErrFs{
 						Fs:        afero.NewMemMapFs(),
-						writeErrs: map[string]error{filepath.Join(baseWorkingDir, string(uid), pbCreds): errBoom},
+						writeErrs: map[string]error{filepath.Join(testBaseWorkingDir, string(uid), pbCreds): errBoom},
 					},
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
@@ -271,8 +292,8 @@ func TestConnect(t *testing.T) {
 			fields: fields{
 				kube: &test.MockClient{
 					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
-						if pc, ok := obj.(*v1alpha1.ProviderConfig); ok {
-							pc.Spec.Credentials = []v1alpha1.ProviderCredentials{{
+						if pc, ok := obj.(*clusterv1alpha1.ProviderConfig); ok {
+							pc.Spec.Credentials = []clusterv1alpha1.ProviderCredentials{{
 								Filename: ".git-credentials",
 								Source:   xpv1.CredentialsSourceNone,
 							}}
@@ -284,21 +305,19 @@ func TestConnect(t *testing.T) {
 				fs: afero.Afero{
 					Fs: &ErrFs{
 						Fs:        afero.NewMemMapFs(),
-						writeErrs: map[string]error{filepath.Join("/tmp", baseWorkingDir, string(uid), ".git-credentials"): errBoom},
+						writeErrs: map[string]error{filepath.Join("/tmp", testBaseWorkingDir, string(uid), ".git-credentials"): errBoom},
 					},
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
-						ForProvider: v1alpha1.AnsibleRunParameters{
-							Roles: []v1alpha1.Role{
-								myRole,
-							},
+						ForProvider: clusterv1alpha1.AnsibleRunParameters{
+							Roles: []clusterv1alpha1.Role{myRole},
 						},
 					},
 				},
@@ -315,18 +334,18 @@ func TestConnect(t *testing.T) {
 				fs: afero.Afero{
 					Fs: &ErrFs{
 						Fs:        afero.NewMemMapFs(),
-						writeErrs: map[string]error{filepath.Join(baseWorkingDir, string(uid), runnerutil.PlaybookYml): errBoom},
+						writeErrs: map[string]error{filepath.Join(testBaseWorkingDir, string(uid), runnerutil.PlaybookYml): errBoom},
 					},
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
-						ForProvider: v1alpha1.AnsibleRunParameters{
+						ForProvider: clusterv1alpha1.AnsibleRunParameters{
 							PlaybookInline: &inlineYaml,
 						},
 					},
@@ -344,18 +363,18 @@ func TestConnect(t *testing.T) {
 				fs: afero.Afero{
 					Fs: &ErrFs{
 						Fs:        afero.NewMemMapFs(),
-						writeErrs: map[string]error{filepath.Join(baseWorkingDir, string(uid), runnerutil.Hosts): errBoom},
+						writeErrs: map[string]error{filepath.Join(testBaseWorkingDir, string(uid), runnerutil.Hosts): errBoom},
 					},
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
-						ForProvider: v1alpha1.AnsibleRunParameters{
+						ForProvider: clusterv1alpha1.AnsibleRunParameters{
 							InventoryInline: &inlineYaml,
 						},
 					},
@@ -373,18 +392,18 @@ func TestConnect(t *testing.T) {
 				fs: afero.Afero{
 					Fs: &ErrFs{
 						Fs:        afero.NewMemMapFs(),
-						chmodErrs: map[string]error{filepath.Join(baseWorkingDir, string(uid), runnerutil.Hosts): errBoom},
+						chmodErrs: map[string]error{filepath.Join(testBaseWorkingDir, string(uid), runnerutil.Hosts): errBoom},
 					},
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
-						ForProvider: v1alpha1.AnsibleRunParameters{
+						ForProvider: clusterv1alpha1.AnsibleRunParameters{
 							InventoryInline: &inlineYaml,
 						},
 					},
@@ -400,12 +419,12 @@ func TestConnect(t *testing.T) {
 				},
 				usage: resource.TrackerFn(func(_ context.Context, _ resource.Managed) error { return nil }),
 				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
-				ansible: func(_ string) params {
+				ansibleFunc: func(_ string) params {
 					return MockPs{
-						MockInit: func(_ context.Context, cr *v1alpha1.AnsibleRun, behaviorVars map[string]string) (*ansible.Runner, error) {
+						MockInit: func(_ context.Context, _ ansible.RunCR, _ map[string]string) (*ansible.Runner, error) {
 							return nil, errBoom
 						},
-						MockGalaxyInstall: func(_ context.Context, _ map[string]string, requirementsType string) error {
+						MockGalaxyInstall: func(_ context.Context, _ map[string]string, _ string) error {
 							return nil
 						},
 						MockAddFile: func(_ string, _ []byte) error {
@@ -415,9 +434,9 @@ func TestConnect(t *testing.T) {
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
@@ -431,7 +450,7 @@ func TestConnect(t *testing.T) {
 			fields: fields{
 				kube: &test.MockClient{
 					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
-						if pc, ok := obj.(*v1alpha1.ProviderConfig); ok {
+						if pc, ok := obj.(*clusterv1alpha1.ProviderConfig); ok {
 							pc.Spec.Requirements = &requirements
 						}
 						return nil
@@ -439,9 +458,9 @@ func TestConnect(t *testing.T) {
 				},
 				usage: resource.TrackerFn(func(_ context.Context, _ resource.Managed) error { return nil }),
 				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
-				ansible: func(_ string) params {
+				ansibleFunc: func(_ string) params {
 					return MockPs{
-						MockInit: func(_ context.Context, _ *v1alpha1.AnsibleRun, _ map[string]string) (*ansible.Runner, error) {
+						MockInit: func(_ context.Context, _ ansible.RunCR, _ map[string]string) (*ansible.Runner, error) {
 							return nil, nil
 						},
 						MockGalaxyInstall: func(_ context.Context, _ map[string]string, _ string) error {
@@ -454,9 +473,9 @@ func TestConnect(t *testing.T) {
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
@@ -473,9 +492,9 @@ func TestConnect(t *testing.T) {
 				},
 				usage: resource.TrackerFn(func(_ context.Context, _ resource.Managed) error { return nil }),
 				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
-				ansible: func(_ string) params {
+				ansibleFunc: func(_ string) params {
 					return MockPs{
-						MockInit: func(_ context.Context, _ *v1alpha1.AnsibleRun, _ map[string]string) (*ansible.Runner, error) {
+						MockInit: func(_ context.Context, _ ansible.RunCR, _ map[string]string) (*ansible.Runner, error) {
 							return nil, nil
 						},
 						MockGalaxyInstall: func(_ context.Context, _ map[string]string, _ string) error {
@@ -488,9 +507,9 @@ func TestConnect(t *testing.T) {
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{
+				cr: &clusterv1alpha1.AnsibleRun{
 					ObjectMeta: metav1.ObjectMeta{UID: uid},
-					Spec: v1alpha1.AnsibleRunSpec{
+					Spec: clusterv1alpha1.AnsibleRunSpec{
 						ResourceSpec: xpv1.ResourceSpec{
 							ProviderConfigReference: &xpv1.Reference{},
 						},
@@ -503,11 +522,16 @@ func TestConnect(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			c := connector{
-				kube:    tc.fields.kube,
-				usage:   tc.fields.usage,
-				fs:      tc.fields.fs,
-				ansible: tc.fields.ansible,
+			c := connector[*clusterv1alpha1.AnsibleRun]{
+				kube:                tc.fields.kube,
+				usage:               tc.fields.usage,
+				fs:                  tc.fields.fs,
+				ansibleFunc:         tc.fields.ansibleFunc,
+				baseWorkingDir:      testBaseWorkingDir,
+				leaseNamespace:      testLeaseNamespace,
+				leaseNameTemplate:   testLeaseNameTemplate,
+				getProviderConfigNS: func(_ client.Object) string { return "" },
+				getForProvider:      testForProvider,
 			}
 			_, err := c.Connect(tc.args.ctx, tc.args.cr)
 			if diff := cmp.Diff(tc.want, err, test.EquateErrors()); diff != "" {
@@ -527,7 +551,7 @@ func TestObserve(t *testing.T) {
 
 	type args struct {
 		ctx context.Context
-		cr  *v1alpha1.AnsibleRun
+		cr  *clusterv1alpha1.AnsibleRun
 	}
 
 	type want struct {
@@ -537,14 +561,14 @@ func TestObserve(t *testing.T) {
 	}
 
 	testPlaybook := "fake playbook"
-	testRun := v1alpha1.AnsibleRun{
+	testRun := clusterv1alpha1.AnsibleRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
 				v1.LastAppliedConfigAnnotation: fmt.Sprintf(`{"playbookInline":"%s"}`, testPlaybook),
 			},
 		},
-		Spec: v1alpha1.AnsibleRunSpec{
-			ForProvider: v1alpha1.AnsibleRunParameters{
+		Spec: clusterv1alpha1.AnsibleRunSpec{
+			ForProvider: clusterv1alpha1.AnsibleRunParameters{
 				PlaybookInline: &testPlaybook,
 			},
 		},
@@ -565,7 +589,7 @@ func TestObserve(t *testing.T) {
 		"PolicyNotSupported": {
 			reason: "We should do no action if the supplied AnsibleRunPolicy is not supported",
 			args: args{
-				cr: &v1alpha1.AnsibleRun{},
+				cr: &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				runner: &ansible.Runner{
@@ -589,7 +613,7 @@ func TestObserve(t *testing.T) {
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{},
+				cr: &clusterv1alpha1.AnsibleRun{},
 			},
 			want: want{
 				err:        fmt.Errorf("%s: %w", errGetAnsibleRun, errBoom),
@@ -606,13 +630,9 @@ func TestObserve(t *testing.T) {
 				},
 				runner: &MockRunner{
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "ObserveAndDelete",
-						}
+						return &ansible.RunPolicy{Name: "ObserveAndDelete"}
 					},
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return nil
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return nil },
 					MockRun: func(ctx context.Context) (io.Reader, error) {
 						return nil, fmt.Errorf("run should not have been called")
 					},
@@ -635,13 +655,9 @@ func TestObserve(t *testing.T) {
 				},
 				runner: &MockRunner{
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "ObserveAndDelete",
-						}
+						return &ansible.RunPolicy{Name: "ObserveAndDelete"}
 					},
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return nil
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return nil },
 					MockRun: func(ctx context.Context) (io.Reader, error) {
 						cmd := exec.Command("ls") //nolint:noctx
 						cmd.Start()
@@ -661,23 +677,17 @@ func TestObserve(t *testing.T) {
 			fields: fields{
 				runner: &MockRunner{
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "CheckWhenObserve",
-						}
+						return &ansible.RunPolicy{Name: "CheckWhenObserve"}
 					},
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return nil
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return nil },
 					MockRun: func(context.Context) (io.Reader, error) {
 						return nil, errBoom
 					},
-					MockEnableCheckMode: func(checkMode bool) {
-
-					},
+					MockEnableCheckMode: func(checkMode bool) {},
 				},
 			},
 			args: args{
-				cr: &v1alpha1.AnsibleRun{},
+				cr: &clusterv1alpha1.AnsibleRun{},
 			},
 			want: want{
 				err: errBoom,
@@ -687,7 +697,11 @@ func TestObserve(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			e := external{runner: tc.fields.runner, kube: tc.fields.kube}
+			e := external[*clusterv1alpha1.AnsibleRun]{
+				runner:         tc.fields.runner,
+				kube:           tc.fields.kube,
+				getForProvider: testForProvider,
+			}
 			got, err := e.Observe(tc.args.ctx, tc.args.cr)
 			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\ne.Observe(...): -want error, +got error:\n%s\n", tc.reason, diff)
@@ -711,7 +725,7 @@ func TestCreateOrUpdate(t *testing.T) {
 
 	type args struct {
 		ctx context.Context
-		cr  *v1alpha1.AnsibleRun
+		cr  *clusterv1alpha1.AnsibleRun
 	}
 
 	type want struct {
@@ -729,7 +743,7 @@ func TestCreateOrUpdate(t *testing.T) {
 		"RunErrorWithObserveAndDeletePolicy": {
 			reason: "We should return any error we encounter when running the runner",
 			args: args{
-				cr: &v1alpha1.AnsibleRun{},
+				cr: &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				kube: &test.MockClient{
@@ -737,9 +751,7 @@ func TestCreateOrUpdate(t *testing.T) {
 				},
 				runner: &MockRunner{
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "ObserveAndDelete",
-						}
+						return &ansible.RunPolicy{Name: "ObserveAndDelete"}
 					},
 					MockEnableCheckMode: func(checkMode bool) {},
 					MockRun: func(context.Context) (io.Reader, error) {
@@ -756,7 +768,7 @@ func TestCreateOrUpdate(t *testing.T) {
 			reason: "We should not return an error when we successfully delete the AnsibleRun resource",
 			args: args{
 				ctx: context.Background(),
-				cr:  &v1alpha1.AnsibleRun{},
+				cr:  &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				kube: &test.MockClient{
@@ -764,9 +776,7 @@ func TestCreateOrUpdate(t *testing.T) {
 				},
 				runner: &MockRunner{
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "ObserveAndDelete",
-						}
+						return &ansible.RunPolicy{Name: "ObserveAndDelete"}
 					},
 					MockEnableCheckMode: func(checkMode bool) {},
 					MockRun: func(ctx context.Context) (io.Reader, error) {
@@ -784,7 +794,7 @@ func TestCreateOrUpdate(t *testing.T) {
 			reason: "We should return any error we encounter when running the runner",
 			args: args{
 				ctx: context.Background(),
-				cr:  &v1alpha1.AnsibleRun{},
+				cr:  &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				kube: &test.MockClient{
@@ -792,9 +802,7 @@ func TestCreateOrUpdate(t *testing.T) {
 				},
 				runner: &MockRunner{
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "CheckWhenObserve",
-						}
+						return &ansible.RunPolicy{Name: "CheckWhenObserve"}
 					},
 					MockEnableCheckMode: func(checkMode bool) {},
 					MockRun: func(context.Context) (io.Reader, error) {
@@ -811,7 +819,7 @@ func TestCreateOrUpdate(t *testing.T) {
 			reason: "We should not return an error when we successfully delete the AnsibleRun resource",
 			args: args{
 				ctx: context.Background(),
-				cr:  &v1alpha1.AnsibleRun{},
+				cr:  &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				kube: &test.MockClient{
@@ -819,9 +827,7 @@ func TestCreateOrUpdate(t *testing.T) {
 				},
 				runner: &MockRunner{
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "CheckWhenObserve",
-						}
+						return &ansible.RunPolicy{Name: "CheckWhenObserve"}
 					},
 					MockEnableCheckMode: func(checkMode bool) {},
 					MockRun: func(ctx context.Context) (io.Reader, error) {
@@ -839,7 +845,11 @@ func TestCreateOrUpdate(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			e := external{runner: tc.fields.runner, kube: tc.fields.kube}
+			e := external[*clusterv1alpha1.AnsibleRun]{
+				runner:         tc.fields.runner,
+				kube:           tc.fields.kube,
+				getForProvider: testForProvider,
+			}
 			got, err := e.Create(tc.args.ctx, tc.args.cr)
 			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\ne.Observe(...): -want error, +got error:\n%s\n", tc.reason, diff)
@@ -873,7 +883,7 @@ func TestDelete(t *testing.T) {
 
 	type args struct {
 		ctx context.Context
-		cr  *v1alpha1.AnsibleRun
+		cr  *clusterv1alpha1.AnsibleRun
 	}
 
 	cases := map[string]struct {
@@ -885,17 +895,13 @@ func TestDelete(t *testing.T) {
 		"writeExtraVarErrorWithObserveAndDeletePolicy": {
 			reason: "We should return any error we encounter writing env variable env/extravars",
 			args: args{
-				cr: &v1alpha1.AnsibleRun{},
+				cr: &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				runner: &MockRunner{
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return errBoom
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return errBoom },
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "ObserveAndDelete",
-						}
+						return &ansible.RunPolicy{Name: "ObserveAndDelete"}
 					},
 				},
 			},
@@ -905,17 +911,13 @@ func TestDelete(t *testing.T) {
 			reason: "We should return any error we encounter when running the runner",
 			args: args{
 				ctx: context.Background(),
-				cr:  &v1alpha1.AnsibleRun{},
+				cr:  &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				runner: &MockRunner{
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return nil
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return nil },
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "ObserveAndDelete",
-						}
+						return &ansible.RunPolicy{Name: "ObserveAndDelete"}
 					},
 					MockRun: func(context.Context) (io.Reader, error) {
 						return nil, errBoom
@@ -928,17 +930,13 @@ func TestDelete(t *testing.T) {
 			reason: "We should not return an error when we successfully delete the AnsibleRun resource",
 			args: args{
 				ctx: context.Background(),
-				cr:  &v1alpha1.AnsibleRun{},
+				cr:  &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				runner: &MockRunner{
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return nil
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return nil },
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "ObserveAndDelete",
-						}
+						return &ansible.RunPolicy{Name: "ObserveAndDelete"}
 					},
 					MockRun: func(ctx context.Context) (io.Reader, error) {
 						cmd := exec.CommandContext(ctx, "ls")
@@ -953,17 +951,13 @@ func TestDelete(t *testing.T) {
 			reason: "We should return any error we encounter when running the runner",
 			args: args{
 				ctx: context.Background(),
-				cr:  &v1alpha1.AnsibleRun{},
+				cr:  &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				runner: &MockRunner{
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return nil
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return nil },
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "CheckWhenObserve",
-						}
+						return &ansible.RunPolicy{Name: "CheckWhenObserve"}
 					},
 					MockRun: func(context.Context) (io.Reader, error) {
 						return nil, errBoom
@@ -976,17 +970,13 @@ func TestDelete(t *testing.T) {
 			reason: "We should not return an error when we successfully delete the AnsibleRun resource",
 			args: args{
 				ctx: context.Background(),
-				cr:  &v1alpha1.AnsibleRun{},
+				cr:  &clusterv1alpha1.AnsibleRun{},
 			},
 			fields: fields{
 				runner: &MockRunner{
-					MockWriteExtraVar: func(extraVar map[string]interface{}) error {
-						return nil
-					},
+					MockWriteExtraVar: func(extraVar map[string]interface{}) error { return nil },
 					MockAnsibleRunPolicy: func() *ansible.RunPolicy {
-						return &ansible.RunPolicy{
-							Name: "CheckWhenObserve",
-						}
+						return &ansible.RunPolicy{Name: "CheckWhenObserve"}
 					},
 					MockRun: func(ctx context.Context) (io.Reader, error) {
 						cmd := exec.CommandContext(ctx, "ls")
@@ -1001,7 +991,11 @@ func TestDelete(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			e := external{runner: tc.fields.runner, kube: tc.fields.kube}
+			e := external[*clusterv1alpha1.AnsibleRun]{
+				runner:         tc.fields.runner,
+				kube:           tc.fields.kube,
+				getForProvider: testForProvider,
+			}
 			_, err := e.Delete(tc.args.ctx, tc.args.cr)
 			if diff := cmp.Diff(tc.want, err, test.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\ne.Delete(...): -want error, +got error:\n%s\n", tc.reason, diff)

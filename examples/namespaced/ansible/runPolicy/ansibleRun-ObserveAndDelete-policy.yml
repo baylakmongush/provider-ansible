@@ -1,0 +1,61 @@
+apiVersion: ansible.m.crossplane.io/v1alpha1
+kind: AnsibleRun
+metadata:
+  annotations:
+    ansible.crossplane.io/runPolicy: ObserveAndDelete
+  name: gcpbucket
+  namespace: default
+spec:
+  forProvider:
+    playbookInline: |
+      ---
+      - hosts: localhost
+        pre_tasks:
+          - name: Install requests python package on version 2.28.1
+            ansible.builtin.pip:
+              name: requests==2.28.1
+              extra_args: --user
+          - name: Install google-auth python package on version 2.12.0
+            ansible.builtin.pip:
+              name: google-auth==2.12.0
+              extra_args: --user
+        tasks:
+          - name: create a gcp bucket
+            google.cloud.gcp_storage_bucket:
+              name: ansible-storage-module
+              project: test-project
+              auth_kind: serviceaccount
+              service_account_file: gcp-credentials.json
+              state: present
+            when: ansible_provider_meta.gcpbucket.state == 'present'
+  providerConfigRef:
+    name: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: default
+  name: gcp-credentials
+type: Opaque
+data:
+  credentials: QkFTRTY0RU5DT0RFRF9QUk9WSURFUl9DUkVEUw==
+---
+apiVersion: ansible.m.crossplane.io/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: default
+  namespace: default
+spec:
+  credentials:
+    - filename: gcp-credentials.json
+      source: Secret
+      secretRef:
+        namespace: default
+        name: gcp-credentials
+        key: credentials
+  requirements: |
+    ---
+    collections:
+      - name: google.cloud
+        source: https://galaxy.ansible.com
+        version: "1.0.2"
